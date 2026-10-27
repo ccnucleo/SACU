@@ -224,6 +224,65 @@ CREATE INDEX IF NOT EXISTS idx_search_index_ngram ON public.professors_search_in
 CREATE INDEX IF NOT EXISTS idx_search_index_docs_gin ON public.professors_search_index USING gin (documents jsonb_path_ops);
 
 -- =============================================================================
+-- 4. MÓDULO DE REPOSITORIO Y MATERIALES DE CURSOS
+-- =============================================================================
+
+-- Tabla relacional para materiales por curso (ID incremental, sin blobs ni URLs redundantes)
+CREATE TABLE IF NOT EXISTS public.course_materials (
+    id BIGSERIAL PRIMARY KEY,
+    course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    file_path TEXT NOT NULL,                     -- Ruta relativa jerárquica ej. 'Examenes_Parciales/2024-1/EP.pdf'
+    drive_file_id VARCHAR(255) NOT NULL,         -- ID nativo en Google Drive
+    folder_category VARCHAR(100) DEFAULT 'General', -- Categoría inferida de la carpeta contenedora
+    mime_type VARCHAR(100) DEFAULT 'application/pdf',
+    size_bytes BIGINT DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()),
+    CONSTRAINT uq_course_material UNIQUE (drive_file_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_course_materials_course_id ON public.course_materials(course_id);
+CREATE INDEX IF NOT EXISTS idx_course_materials_drive_id ON public.course_materials(drive_file_id);
+CREATE INDEX IF NOT EXISTS idx_course_materials_category ON public.course_materials(folder_category);
+
+-- Permisos: el BIGSERIAL crea la secuencia course_materials_id_seq, que requiere
+-- USAGE explícito; sin esto PostgREST responde 403 (42501) en cada INSERT.
+GRANT SELECT ON public.course_materials TO anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.course_materials TO authenticated, service_role;
+GRANT USAGE, SELECT ON SEQUENCE public.course_materials_id_seq TO authenticated, service_role;
+
+-- Vista agregada para consumo directo por parte de sistemas externos
+CREATE OR REPLACE VIEW public.v_courses_with_materials AS
+SELECT 
+    c.id AS course_id,
+    c.course_code,
+    c.full_name AS course_name,
+    f.code AS faculty_code,
+    COUNT(m.id) AS total_materials,
+    COALESCE(
+        jsonb_agg(
+            jsonb_build_object(
+                'id', m.id,
+                'name', m.name,
+                'file_path', m.file_path,
+                'category', m.folder_category,
+                'drive_file_id', m.drive_file_id,
+                'mime_type', m.mime_type,
+                'size_bytes', m.size_bytes
+            ) ORDER BY m.file_path
+        ) FILTER (WHERE m.id IS NOT NULL),
+        '[]'::jsonb
+    ) AS materials
+FROM public.courses c
+LEFT JOIN public.faculties f ON c.faculty_id = f.id
+LEFT JOIN public.course_materials m ON c.id = m.course_id
+GROUP BY c.id, c.course_code, c.full_name, f.code;
+
+COMMENT ON TABLE public.course_materials IS 'Almacén relacional de materiales y archivos indexados por curso, referenciando Google Drive.';
+COMMENT ON VIEW public.v_courses_with_materials IS 'Vista optimizada para consultar cursos con su lista estructurada de materiales vía PostgREST.';
+
+-- =============================================================================
 -- COMENTARIOS DESCRIPTIVOS
 -- =============================================================================
 COMMENT ON TABLE public.csp_documents IS 'Catálogo central de documentos guía CSP con metadatos y su índice de profesores/cursos.';

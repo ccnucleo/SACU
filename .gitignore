@@ -5,6 +5,10 @@
 credentials.json
 *.log
 
+# Database's SQL
+supabase.sql
+supabase copy.sql
+
 # Dependencies
 node_modules/
 .pnpm-store/

@@ -2,6 +2,7 @@ import os
 import re
 import json
 import urllib.request
+import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Dict, Any, List
@@ -91,12 +92,19 @@ def collect_file_nodes(node: Dict[str, Any], current_path: str = "") -> List[Dic
     node_name = node.get("name", "")
 
     if node_type == "file":
+        # Extraer categoría a partir del primer nivel del árbol de directorios
+        category = "General"
+        if current_path:
+            parts = current_path.split("/")
+            category = parts[0] if parts else "General"
+
         files.append({
             "name": node_name,
-            "id": node.get("id", ""),
-            "path": f"{current_path}/{node_name}" if current_path else node_name,
-            "mimeType": node.get("mimeType", "application/pdf"),
-            "size": node.get("size", 0)
+            "drive_file_id": node.get("id", ""),
+            "file_path": f"{current_path}/{node_name}" if current_path else node_name,
+            "folder_category": category,
+            "mime_type": node.get("mimeType", "application/pdf"),
+            "size_bytes": node.get("size") or 0
         })
     elif node_type == "folder":
         new_path = f"{current_path}/{node_name}" if current_path else node_name
@@ -164,6 +172,14 @@ class SupabaseUploader:
                 if res_bytes:
                     return json.loads(res_bytes.decode('utf-8'))
                 return []
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode('utf-8')[:300]
+            except Exception:
+                pass
+            print(f"[SupabaseUploader] Error HTTP {e.code} {method} {endpoint.split('?')[0]}: {detail}")
+            return None
         except Exception as e:
             print(f"[SupabaseUploader] Aviso HTTP {method} {endpoint}: {e}")
             return None
@@ -196,65 +212,96 @@ class SupabaseUploader:
             return new_course[0]["id"]
         return ""
 
-    def sync_planchas(self, course_db_id: str, files: List[Dict[str, Any]]):
-        if not course_db_id:
-            return
-
-        for f in files:
-            file_name = f.get("name", "")
-            file_id = f.get("id", "")
-            pdf_url = f"https://drive.google.com/file/d/{file_id}/view" if file_id else ""
-
-            self._request(
-                "planchas",
-                method="POST",
-                data={
-                    "course_id": course_db_id,
-                    "tipo": "Material",
-                    "ciclo": "General",
-                    "profesor": file_name,
-                    "pdf_url": pdf_url,
-                    "es_premium": False,
-                    "costo_monedas": 0
-                },
-                prefer_headers="resolution=ignore-duplicates"
+    def fetch_existing_drive_ids(self, course_db_id: str, page_size: int = 1000) -> Any:
+        """
+        Obtiene el conjunto de drive_file_id ya registrados para el curso.
+        Pagina con limit/offset porque PostgREST limita las filas por respuesta (1000 por defecto en Supabase).
+        Retorna None si la consulta falla, para no asumir que el curso está vacío.
+        """
+        existing = set()
+        offset = 0
+        while True:
+            rows = self._request(
+                f"course_materials?select=drive_file_id&course_id=eq.{course_db_id}"
+                f"&order=id.asc&limit={page_size}&offset={offset}"
             )
+            if rows is None:
+                return None
+            existing.update(r["drive_file_id"] for r in rows if r.get("drive_file_id"))
+            if len(rows) < page_size:
+                return existing
+            offset += page_size
 
-    def sync_profesores_documentos(self, course_id: str, course_name: str, total_files: int, tree_data: Dict[str, Any]):
-        doc_id = f"course_{course_id}"
-        self._request(
-            "profesores_documentos",
-            method="POST",
-            data={
-                "doc_id": doc_id,
-                "file_name": f"{course_name} ({course_id})",
-                "periodo": "General",
-                "ciclo": "General",
-                "total_pages": total_files,
-                "metadata": {
-                    "course_id": course_id,
-                    "course_name": course_name,
-                    "total_files": total_files,
-                    "scanned_at": datetime.now(timezone.utc).isoformat(),
-                    "tree": tree_data
-                }
-            },
-            prefer_headers="resolution=merge-duplicates"
-        )
+    def sync_course_materials(self, course_db_id: str, materials: List[Dict[str, Any]]) -> Dict[str, int]:
+        """
+        Sincronización incremental de 'course_materials' usando el ID de Google Drive como llave:
+        consulta los materiales ya registrados del curso e inserta solo los nuevos.
+        No elimina ni reescribe registros existentes.
+        Retorna {"total", "existing", "new", "inserted", "failed"}; failed=1 indica error de consulta/inserción.
+        """
+        stats = {"total": len(materials), "existing": 0, "new": 0, "inserted": 0, "failed": 0}
+        if not course_db_id:
+            stats["failed"] = 1
+            return stats
+        if not materials:
+            return stats
+
+        # 1. Consultar qué materiales ya están en Supabase (por drive_file_id)
+        existing_ids = self.fetch_existing_drive_ids(course_db_id)
+        if existing_ids is None:
+            # Si no se pudo consultar, no insertamos para evitar duplicados
+            stats["failed"] = 1
+            return stats
+
+        # 2. Filtrar solo los nuevos (también deduplica IDs repetidos dentro del mismo escaneo)
+        payload = []
+        seen = set(existing_ids)
+        for m in materials:
+            drive_id = m.get("drive_file_id", "")
+            if not drive_id:
+                continue
+            if drive_id in seen:
+                if drive_id in existing_ids:
+                    stats["existing"] += 1
+                continue
+            seen.add(drive_id)
+            payload.append({
+                "course_id": course_db_id,
+                "name": m.get("name", ""),
+                "file_path": m.get("file_path", ""),
+                "drive_file_id": drive_id,
+                "folder_category": m.get("folder_category", "General"),
+                "mime_type": m.get("mime_type", "application/pdf"),
+                "size_bytes": m.get("size_bytes", 0)
+            })
+        stats["new"] = len(payload)
+
+        # 3. Insertar únicamente los materiales nuevos en lotes
+        batch_size = 100
+        for i in range(0, len(payload), batch_size):
+            batch = payload[i:i + batch_size]
+            res = self._request("course_materials", method="POST", data=batch, prefer_headers="return=minimal")
+            if res is not None:
+                stats["inserted"] += len(batch)
+            else:
+                stats["failed"] = 1
+        return stats
 
 class UnifiedCourseScanner:
     """
-    Proceso unificado de escaneo, anotación, persistencia local (SACU)
-    y sincronización a Supabase (aplicativos externos).
+    Proceso unificado de escaneo, anotación, persistencia local (opcional/debug)
+    y sincronización a Supabase en base de datos relacional.
     """
-    def __init__(self, storage_dir: str = COURSES_DIR):
+    def __init__(self, storage_dir: str = COURSES_DIR, save_local: bool = True):
         self.storage_dir = storage_dir
-        os.makedirs(self.storage_dir, exist_ok=True)
+        self.save_local = save_local
+        if self.save_local:
+            os.makedirs(self.storage_dir, exist_ok=True)
         self.uploader = SupabaseUploader(SUPABASE_URL, SUPABASE_KEY, SUPABASE_USER_EMAIL, SUPABASE_USER_PASSWORD)
 
     def run(self) -> List[Dict[str, Any]]:
         print("==================================================")
-        print("SACU - Proceso Unificado de Cursos (Local + Supabase)")
+        print("SACU - Proceso Unificado de Cursos (Relacional Supabase)")
         print("==================================================")
 
         # 1. Obtener cursos desde Google Drive o estructura local
@@ -265,16 +312,19 @@ class UnifiedCourseScanner:
             print("[1/3 Escaneo] GOOGLE_DRIVE_FOLDER_ID no configurado. Procesando archivos locales...")
             results = self._process_local_courses()
 
-        # 2. Guardar archivos localmente para la plataforma SACU
-        print(f"\n[2/3 Almacenamiento Local] Guardando JSONs anotados en '{self.storage_dir}'...")
-        self._save_local_files_and_manifest(results)
+        # 2. Guardar archivos localmente (modo debug / cache local si está habilitado)
+        if self.save_local:
+            print(f"\n[2/3 Almacenamiento Local] Guardando JSONs anotados en '{self.storage_dir}'...")
+            self._save_local_files_and_manifest(results)
+        else:
+            print("\n[2/3 Almacenamiento Local] Omitido (Modo puramente relacional en base de datos).")
 
-        # 3. Subir la misma información a Supabase para otros aplicativos
-        print("\n[3/3 Sincronización Supabase] Sincronizando con base de datos remota...")
+        # 3. Subir información relacional a Supabase para SACU y otros aplicativos
+        print("\n[3/3 Sincronización Relacional Supabase] Guardando cursos y materiales en base de datos...")
         self._sync_all_to_supabase(results)
 
         print("\n==================================================")
-        print(f"¡Éxito! Se procesaron {len(results)} cursos sincronizados localmente y en Supabase.")
+        print(f"¡Éxito! Se procesaron {len(results)} cursos sincronizados en base de datos relacional.")
         print("==================================================")
         return results
 
@@ -467,31 +517,46 @@ class UnifiedCourseScanner:
 
     def _sync_all_to_supabase(self, courses_data: List[Dict[str, Any]]):
         if not self.uploader.is_configured():
-            print("  [Supabase] Credenciales no configuradas. Se omitió la subida remota.")
+            print("  [Supabase] Credenciales no configuradas. Se omitió la sincronización remota.")
             return
 
         faculty_db_id = self.uploader.ensure_faculty("sistemas", "Facultad de Ingeniería Industrial y de Sistemas")
 
+        failed_courses = []
         for c in courses_data:
             course_id = c.get("course_id", "")
             course_name = c.get("course_name", "")
             tree = c.get("tree", {})
-            total_files = tree.get("total_files", 0)
 
-            # 1. Upsert en tabla 'courses'
+            # 1. Upsert en tabla relacional 'courses'
             course_db_id = self.uploader.upsert_course(faculty_db_id, course_id, course_name)
 
-            # 2. Sincronizar archivos en tabla 'planchas'
-            flat_files = collect_file_nodes(tree)
-            if course_db_id and flat_files:
-                self.uploader.sync_planchas(course_db_id, flat_files)
+            # 2. Sincronización incremental en 'course_materials' (solo materiales nuevos por drive_file_id)
+            flat_materials = collect_file_nodes(tree)
+            stats = self.uploader.sync_course_materials(course_db_id, flat_materials)
 
-            # 3. Sincronizar árbol completo en 'profesores_documentos'
-            self.uploader.sync_profesores_documentos(course_id, course_name, total_files, tree)
-            print(f"  ✓ Sincronizado en Supabase: {course_id} ({course_name}) -> {len(flat_files)} archivos")
+            if stats["failed"]:
+                failed_courses.append(course_id)
+                print(f"  ✗ Error en Supabase: {course_id} ({course_name}) -> "
+                      f"{stats['inserted']}/{stats['new']} nuevos insertados ({stats['existing']} ya existían)")
+            elif stats["new"] == 0:
+                print(f"  = Sin cambios: {course_id} ({course_name}) -> {stats['existing']} materiales ya registrados")
+            else:
+                print(f"  ✓ Sincronizado en Supabase: {course_id} ({course_name}) -> "
+                      f"+{stats['inserted']} nuevos ({stats['existing']} ya existían)")
+
+        if failed_courses:
+            raise RuntimeError(f"{len(failed_courses)} curso(s) no se sincronizaron completamente: {', '.join(failed_courses)}")
 
 def main():
-    scanner = UnifiedCourseScanner()
+    import sys
+    # Se habilita almacenamiento local si se pasa --debug-local, --save-local o SAVE_LOCAL=true
+    save_local = (
+        "--debug-local" in sys.argv or 
+        "--save-local" in sys.argv or 
+        os.getenv("SAVE_LOCAL", "").lower() in ("true", "1", "yes")
+    )
+    scanner = UnifiedCourseScanner(save_local=save_local)
     scanner.run()
 
 if __name__ == "__main__":
